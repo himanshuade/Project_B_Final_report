@@ -1,0 +1,1168 @@
+---
+title: "Predicting ATP Tennis Match Outcomes: Logistic Regression, Elo, and Hybrid Models"
+author: "Himanshu Muley (A1895211)"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+# Setup and Libraries
+
+```{r libraries}
+library(tidyverse)
+library(dplyr)
+library(elo)
+library(glmnet)
+library(yardstick)
+library(inspectdf)
+```
+
+
+---
+
+# Data Loading and Cleaning
+
+We load all annual ATP match files from 2000 to 2019 and combine them into
+a single dataset. This section also defines the outcome variable and all
+shared features used by every model downstream.
+
+```{r load-data}
+# Load each year
+file_years <- 2000:2019
+tennis_list <- lapply(file_years, function(y) {
+  read_csv(paste0("./data/atp_matches_", y, ".csv"), show_col_types = FALSE)
+})
+combined <- bind_rows(tennis_list)
+```
+
+```{r select-and-clean}
+t_data <- combined %>%
+  select(
+    winner_name, loser_name,
+    winner_rank, loser_rank,
+    winner_rank_points, loser_rank_points,
+    surface, score, tourney_date, tourney_level
+  ) %>%
+  mutate(year = as.integer(substr(tourney_date, 1, 4)))
+
+# Remove rows with any missing values
+t_data <- drop_na(t_data)
+
+# data types of the columns
+t_data <- t_data %>%
+  mutate(
+    winner_rank = as.integer(winner_rank),
+    loser_rank  = as.integer(loser_rank),
+    winner_rank_points = as.integer(winner_rank_points),
+    loser_rank_points = as.integer(loser_rank_points),
+    surface   = as.factor(surface),
+    tourney_level = as.factor(tourney_level)
+  )
+```
+
+## Outcome Definition — Important Note
+
+We define `player_i` and `player_j` by **randomly assigning** which player
+takes each role per match. This avoids the tautology present in a naive
+implementation where `player_i` is always the winner (which would make the
+outcome perfectly predictable from any winner-derived feature).
+
+Under this scheme:
+
+- `outcome = 1` if `player_i` wins the match
+- `outcome = 0` if `player_j` wins the match
+
+The ranking-point difference `rp_diff = rp_i - rp_j` can now be positive
+or negative, giving the logistic model genuine signal to learn from rather
+than a trivially positive number.
+
+```{r outcome-definition}
+set.seed(42)  # for reproducibility
+
+t_data <- t_data %>%
+  mutate(
+    # Randomly decide which player is i and which is j
+    swap = sample(c(TRUE, FALSE), n(), replace = TRUE),
+
+    player_i  = if_else(swap, loser_name,         winner_name),
+    player_j  = if_else(swap, winner_name,         loser_name),
+    rp_i      = if_else(swap, loser_rank_points,   winner_rank_points),
+    rp_j      = if_else(swap, winner_rank_points,  loser_rank_points),
+    rank_i    = if_else(swap, loser_rank,           winner_rank),
+    rank_j    = if_else(swap, winner_rank,           loser_rank),
+
+    # outcome = 1 if player_i won
+    outcome     = if_else(swap, 0L, 1L),
+
+    # ranking point difference from player_i's perspective
+    rp_diff = as.integer(rp_i - rp_j)
+  ) %>%
+  mutate(
+    outcome  = as.factor(outcome),
+    surface = as.factor(surface),
+    tourney_level = as.factor(tourney_level)
+  ) %>%
+  rename(tour_lvl = tourney_level)
+
+inspect_na(t_data)
+```
+
+##Plots
+
+```{r plot-matches-per-year}
+ggplot(t_data, aes(x = year)) +
+  geom_bar(fill = "#4B9CD3") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Number of ATP Matches per Year (2000–2019)",
+    x = "Year",
+    y = "Match Count"
+  )
+```
+
+```{r plot-surface}
+ggplot(t_data, aes(x = surface)) +
+  geom_bar(fill = "#6A5ACD") +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Match Count by Surface Type",
+    x     = "Surface",
+    y     = "Match Count"
+  )
+```
+ 
+
+## Train / Test Split
+
+Matches from 2000–2018 are used for training. The 2019 season is held out
+as the test set, consistent with prior literature and avoiding COVID-19
+disruptions in later years.
+
+```{r train-test-split}
+train <- t_data %>% filter(year >= 2000, year <= 2018)
+test  <- t_data %>% filter(year == 2019)
+
+
+dim(train) #dimentions of the training dataset
+```
+```{r}
+dim(test) #dimentions of the testing dataset
+```
+
+---
+
+# Shared Evaluation Functions
+
+We define all evaluation metrics once and reuse them across every model.
+
+```{r eval-functions}
+# Accuracy at 0.5 threshold
+accuracy_from_prob <- function(y_true, p, threshold = 0.5) {
+  pred_class <- ifelse(p >= threshold, 1, 0)
+  mean(pred_class == y_true)
+}
+
+# Log-loss (with numerical clipping for stability)
+log_loss <- function(y, p) {
+  eps <- 1e-15
+  p   <- pmin(pmax(p, eps), 1 - eps)
+  -mean(y * log(p) + (1 - y) * log(1 - p))
+}
+
+# Brier score
+brier_score <- function(y, p) {
+  mean((p - y)^2)
+}
+
+# Calibration table (equal-width bins)
+calibration_table <- function(y, p, bins = 10) {
+  df      <- data.frame(y = y, p = p)
+  df$bin  <- cut(df$p, breaks = seq(0, 1, length.out = bins + 1),
+                 include.lowest = TRUE)
+  df %>%
+    group_by(bin) %>%
+    summarise(
+      mean_pred   = mean(p),
+      mean_actual = mean(y),
+      count       = n(),
+      .groups     = "drop"
+    )
+}
+
+# Calibration plot function
+plot_calibration <- function(calib_df, title, colour = "blue") {
+  ggplot(calib_df, aes(x = mean_pred, y = mean_actual)) +
+    geom_point(size = 3, colour = colour) +
+    geom_abline(slope = 1, intercept = 0,
+                linetype = "dashed", colour = "red") +
+    labs(
+      title = title,
+      x     = "Mean Predicted Probability",
+      y     = "Empirical Win Rate"
+    ) +
+    theme_minimal()
+}
+
+
+```
+
+---
+
+# Part A — Logistic Regression Models
+
+## Baseline Logistic Regression
+
+The baseline model uses only the ranking-point difference (`rp_diff`) as a
+predictor, with no intercept. This mirrors the specification in Klaassen
+and Magnus (2003) and ensures a 50% predicted probability when both
+players have equal ranking points.
+
+```{r logit-baseline-fit}
+logit_base <- glm(
+  outcome ~ 0 + rp_diff,
+  data   = train,
+  family = binomial(link = "logit")
+)
+
+summary(logit_base)
+
+
+```
+
+```{r logit-baseline-test}
+# Align factor levels between train and test
+test <- test %>%
+  mutate(
+    surface   = factor(surface,   levels = levels(train$surface)),
+    tour_lvl  = factor(tour_lvl,  levels = levels(train$tour_lvl))
+  )
+
+# Predict on test set
+test$prob_base <- predict(logit_base, newdata = test, type = "response")
+test$pred_base <- factor(ifelse(test$prob_base > 0.5, 1, 0), levels = c(0, 1))
+test$outcome   <- factor(test$outcome, levels = c(0, 1))
+
+# Metrics
+y_base <- as.integer(as.character(test$outcome))
+p_base <- test$prob_base
+
+ accuracy_from_prob(y_base, p_base)
+
+```
+```{r}
+ log_loss(y_base, p_base)
+
+```
+
+```{r}
+brier_score(y_base, p_base)
+```
+
+```{r logit-baseline-roc}
+test_roc_base <- test %>%
+  mutate(outcome = factor(outcome, levels = c(0, 1)))
+```
+
+
+```{r}
+roc_base <- roc_curve(test_roc_base, truth = outcome, prob_base,
+                      event_level = "second")
+autoplot(roc_base) +
+  labs(
+    title = "ROC Curve – Baseline Logistic Regression (2019 Test Set)",
+    x     = "1 - Specificity (False Positive Rate)",
+    y     = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal(base_size = 14)
+
+roc_auc(test_roc_base, truth = outcome, prob_base, event_level = "second")
+```
+
+## Extended Logistic Regression
+
+The extended model adds surface type and tournament level as additional
+predictors, motivated by evidence that playing conditions influence ATP
+match outcomes (Kovalchik, 2016).
+
+```{r}
+logit_ext <- glm(outcome ~ 0 + rp_diff + surface + tour_lvl,data = train,
+family = binomial(link = "logit")
+)
+
+summary(logit_ext)
+
+```
+
+```{r}
+anova(logit_ext)
+```
+
+
+```{r logit-extended-test}
+test$prob_ext1 <- predict(logit_ext, newdata = test, type = "response")
+test$pred_ext1 <- factor(ifelse(test$prob_ext1 > 0.5, 1, 0), levels = c(0, 1))
+
+y_ext1 <- as.integer(as.character(test$outcome))
+p_ext1 <- test$prob_ext1
+
+
+ accuracy_from_prob(y_ext1, p_ext1) 
+
+
+ 
+```
+```{r}
+log_loss(y_ext1, p_ext1)
+```
+
+```{r}
+ brier_score(y_ext1, p_ext1)
+```
+
+```{r logit-extended-roc}
+roc_ext1 <- roc_curve(test, truth = outcome, prob_ext1,
+                      event_level = "second")
+autoplot(roc_ext1) +
+  labs(
+    title = "ROC Curve – Extended Logistic Regression (2019 Test Set)",
+    x     = "1 - Specificity (False Positive Rate)",
+    y     = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal(base_size = 14)
+
+roc_auc(test, truth = outcome, prob_ext1, event_level = "second")
+```
+
+---
+
+# Part A — Elo Rating Models
+
+For the Elo models, the outcome must be an integer (0/1) rather than a
+factor. We also use `player_i` and `player_j` as defined in the shared
+data prep above, ensuring consistency with the logistic models.
+
+## Baseline Elo Model
+
+All players begin with a rating of 1500 at the start of 2000. Ratings are
+updated sequentially through each match using K = 32. After training, the
+final 2018 ratings are transferred to the test set.
+
+```{r elo-train-prep}
+train_elo <- train %>%
+  mutate(outcome_int = as.integer(as.character(outcome))) %>%
+  arrange(year)
+```
+
+```{r elo-baseline-train}
+elo_base_run <- elo.run(
+  outcome_int ~ player_i + player_j,
+  data    = train_elo,
+  k       = 32,
+  verbose = FALSE
+)
+
+elo_base_df <- as.data.frame(elo_base_run)
+
+# Store final 2018 ratings
+ratings_2018 <- final.elos(elo_base_run)
+final_ratings <- data.frame(
+  player = names(ratings_2018),
+  rating = as.numeric(ratings_2018)
+)
+```
+
+```{r elo-baseline-test-prep}
+test_elo <- test %>%
+  mutate(outcome_int = as.integer(as.character(outcome))) %>%
+  arrange(year)
+
+# Build starting Elo vector for test — default 1500, overwrite with 2018 ratings
+all_players        <- sort(unique(c(train_elo$player_i, train_elo$player_j,
+                                    test_elo$player_i,  test_elo$player_j)))
+all_players        <- all_players[!is.na(all_players)]
+elos_test          <- rep(1500, length(all_players))
+names(elos_test)   <- all_players
+common             <- intersect(names(ratings_2018), names(elos_test))
+elos_test[common]  <- ratings_2018[common]
+```
+
+```{r elo-baseline-test}
+elo_base_test_run <- elo.run(
+  outcome_int ~ player_i + player_j,
+  data         = test_elo,
+  k            = 0,               # no rating updates on test set
+  initial.elos = elos_test,
+  verbose      = FALSE
+)
+
+elo_base_test_df <- as.data.frame(elo_base_test_run)
+
+test_elo <- test_elo %>%
+  mutate(
+    elo_i_before   = elo_base_test_df$elo.A,
+    elo_j_before   = elo_base_test_df$elo.B,
+    elo_prob_base  = elo_base_test_df$p.A,
+    elo_diff       = elo_i_before - elo_j_before
+  )
+
+y_elo  <- test_elo$outcome_int
+p_elo  <- test_elo$elo_prob_base
+
+
+ accuracy_from_prob(y_elo, p_elo)
+ log_loss(y_elo, p_elo)
+ 
+```
+```{r}
+brier_score(y_elo, p_elo)
+```
+
+```{r elo-baseline-calibration}
+# Note: we use quantile-based bins so every point represents the same
+# number of matches — this gives a fuller, more informative calibration plot.
+calib_elo_base <- calibration_table(y_elo, p_elo, bins = 10)
+cat("Calibration table — number of non-empty bins:",
+    sum(!is.na(calib_elo_base$mean_pred)), "\n")
+calib_elo_base
+
+plot_calibration(calib_elo_base,
+                 "Calibration Curve – Baseline Elo (2019)",
+                 colour = "blue")
+```
+A calibration curve checks whether your predicted probabilities are trustworthy.
+Each dot is a group of matches. You take all matches where the model predicted 
+around the same probability (say 0.20–0.30), group them into a bin, and then 
+check: out of those matches, how many did player ii i actually win?
+If the model is perfect: a dot at predicted 0.25 should have an actual win rate
+of 0.25 too. Every dot would sit on the red dashed line.
+
+What the chart shows:
+
+The dot around predicted 0.25 has an actual win rate of ~0.37 — the model said 
+"25% chance" but the player actually won 37% of the time. The model is too 
+pessimistic here.The dots around 0.60–0.75 sit below the line — the model said 
+"70% chance" but the player only won ~60% of the time. The model is too 
+confident here.
+
+
+
+## Extended Elo Model (Surface-Specific K)
+
+The K-factor is varied by surface to reflect differing levels of match
+volatility across surfaces, following Kovalchik (2020).
+
+```{r elo-extended-train}
+train_elo_ext <- train_elo %>%
+  mutate(
+    k_surface = case_when(
+      surface == "Clay"   ~ 36,
+      surface == "Grass"  ~ 24,
+      surface == "Hard"   ~ 32,
+      surface == "Carpet" ~ 28,
+      TRUE                ~ 32
+    )
+  )
+
+elo_ext_run <- elo.run(
+  outcome_int ~ player_i + player_j,
+  data    = train_elo_ext,
+  k       = train_elo_ext$k_surface,
+  verbose = FALSE
+)
+
+ratings_2018_ext        <- final.elos(elo_ext_run)
+elos_test_ext           <- rep(1500, length(all_players))
+names(elos_test_ext)    <- all_players
+common_ext              <- intersect(names(ratings_2018_ext), names(elos_test_ext))
+elos_test_ext[common_ext] <- ratings_2018_ext[common_ext]
+```
+
+```{r elo-extended-test}
+elo_ext_test_run <- elo.run(
+  outcome_int ~ player_i + player_j,
+  data         = test_elo,
+  k            = 0,
+  initial.elos = elos_test_ext,
+  verbose      = FALSE
+)
+
+elo_ext_test_df <- as.data.frame(elo_ext_test_run)
+
+test_elo <- test_elo %>%
+  mutate(elo_prob_ext = elo_ext_test_df$p.A)
+
+y_elo_ext <- test_elo$outcome_int
+p_elo_ext <- test_elo$elo_prob_ext
+
+
+ accuracy_from_prob(y_elo_ext, p_elo_ext)
+ log_loss(y_elo_ext, p_elo_ext)
+
+```
+```{r}
+ brier_score(y_elo_ext, p_elo_ext)
+```
+
+```{r elo-extended-calibration}
+calib_elo_ext <- calibration_table(y_elo_ext, p_elo_ext, bins = 10)
+plot_calibration(calib_elo_ext,
+                 "Calibration Curve – Extended Elo, Surface-K (2019)",
+                 colour = "darkgreen")
+```
+
+---
+
+# Part B — Elo-Logistic Hybrid Model
+
+## Motivation
+
+The logistic models in Part A used ATP ranking-point difference as the
+sole predictor. While interpretable, this feature is static — it does not
+capture player form over time. The Elo rating system, by contrast, updates
+dynamically after each match and reflects recent performance.
+
+In Part B, we use the **Elo ratings trained on 2000–2018** as features
+inside a logistic regression model. Specifically, for each 2019 test match
+we have:
+
+- elo_diff — the difference in pre-match Elo ratings (player_i minus player_j)
+- elo_prob_base — the Elo-derived win probability for player_i
+
+This hybrid approach combines the dynamic, history-aware nature of Elo
+with the statistical interpretability of logistic regression, and allows
+us to compare it directly against the Part A models using the same
+evaluation metrics.+
+
+## Hybrid Model: Elo Difference as Predictor
+
+```{r hybrid-prep}
+# Attach Elo features to training set using training Elo values
+train_elo_df <- as.data.frame(elo_base_run)
+
+train_hybrid <- train_elo %>%
+  mutate(
+    elo_i_before  = train_elo_df$elo.A,
+    elo_j_before  = train_elo_df$elo.B,
+    elo_prob_train = train_elo_df$p.A,
+    elo_diff      = elo_i_before - elo_j_before
+  )
+```
+
+```{r hybrid-fit}
+# Baseline hybrid: elo_diff only, no intercept (mirrors logistic baseline)
+hybrid_base <- glm(
+  outcome_int ~ 0 + elo_diff,
+  data   = train_hybrid,
+  family = binomial(link = "logit")
+)
+
+summary(hybrid_base)
+```
+
+```{r hybrid-test}
+# Generate predicted probabilities on the 2019 test set
+test_elo$prob_hybrid_base <- predict(
+  hybrid_base,
+  newdata = test_elo,
+  type    = "response"
+)
+
+# Extract actual outcomes and predicted probabilities
+y_hyb  <- test_elo$outcome_int
+p_hyb  <- test_elo$prob_hybrid_base
+
+
+ accuracy_from_prob(y_hyb, p_hyb)
+ log_loss(y_hyb, p_hyb)
+ 
+```
+```{r}
+brier_score(y_hyb, p_hyb)
+```
+
+```{r hybrid-roc}
+# Convert outcome to factor for ROC analysis
+
+test_elo_roc <- test_elo %>%
+  mutate(outcome_fac = factor(outcome_int, levels = c(0, 1)))
+
+# Compute ROC curve for hybrid baseline
+roc_hybrid <- roc_curve(test_elo_roc,
+                        truth        = outcome_fac,
+                        prob_hybrid_base,
+                        event_level  = "second")
+autoplot(roc_hybrid) +
+  labs(
+    title = "ROC Curve – Hybrid Model (Elo diff in Logistic Regression)",
+    x     = "1 - Specificity (False Positive Rate)",
+    y     = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+```
+```{r}
+roc_auc(test_elo_roc,
+        truth       = outcome_fac,
+        prob_hybrid_base,
+        event_level = "second")
+
+```
+
+```{r hybrid-calibration}
+calib_hybrid <- calibration_table(y_hyb, p_hyb, bins = 10)
+plot_calibration(calib_hybrid,
+                 "Calibration Curve – Hybrid Model (2019)",
+                 colour = "purple")
+```
+
+## Extended Hybrid: Elo Difference + Surface + Tournament Level
+
+```{r hybrid-ext-fit}
+# Extended Hybrid (Elo diff + surface + tournament level)
+
+hybrid_ext <- glm(
+  outcome_int ~ 0 + elo_diff + surface + tour_lvl,
+  data   = train_hybrid,
+  family = binomial(link = "logit")
+)
+
+summary(hybrid_ext)
+
+```
+```{r}
+anova(hybrid_ext)
+```
+
+```{r hybrid-ext-test}
+# Predict on test set and evaluate
+
+test_elo$prob_hybrid_ext <- predict(
+  hybrid_ext,
+  newdata = test_elo,
+  type    = "response"
+)
+
+y_hyb_ext <- test_elo$outcome_int
+p_hyb_ext <- test_elo$prob_hybrid_ext
+
+
+accuracy_from_prob(y_hyb_ext, p_hyb_ext)
+log_loss(y_hyb_ext, p_hyb_ext)
+ 
+```
+
+```{r}
+ brier_score(y_hyb_ext, p_hyb_ext)
+```
+
+
+```{r hybrid-ext-calibration}
+calib_hybrid_ext <- calibration_table(y_hyb_ext, p_hyb_ext, bins = 10)
+plot_calibration(calib_hybrid_ext,
+                 "Calibration Curve – Extended Hybrid Model (2019)",
+                 colour = "darkred")
+```
+
+## Interaction Model: Elo Difference × Surface
+
+Adding an interaction term `elo_diff:surface` allows the model to learn
+that Elo difference may be a stronger predictor on some surfaces than
+others. For example, clay court matches tend to favour the higher-rated
+player more consistently, while grass court results are more volatile
+due to the serve-dominant nature of the surface (Kovalchik, 2020).
+
+```{r hybrid-interact-fit}
+ #Interaction Model (Elo diff × surface)
+# Allows the effect of Elo difference to vary by surface
+hybrid_interact <- glm(
+  outcome_int ~ 0 + elo_diff + elo_diff:surface,
+  data   = train_hybrid,
+  family = binomial(link = "logit")
+)
+
+summary(hybrid_interact)
+```
+
+```{r hybrid-interact-test}
+test_elo$prob_hybrid_interact <- predict(
+  hybrid_interact,
+  newdata = test_elo,
+  type    = "response"
+)
+
+y_hyb_int <- test_elo$outcome_int
+p_hyb_int <- test_elo$prob_hybrid_interact
+
+accuracy_from_prob(y_hyb_int, p_hyb_int)
+log_loss(y_hyb_int, p_hyb_int)
+brier_score(y_hyb_int, p_hyb_int)
+```
+
+```{r hybrid-interact-calibration}
+calib_hybrid_int <- calibration_table(y_hyb_int, p_hyb_int, bins = 10)
+plot_calibration(calib_hybrid_int,
+                 "Calibration Curve – Interaction Hybrid (2019)",
+                 colour = "orange")
+```
+
+## Combined Model: Ranking Points + Elo Difference
+
+This model uses both `rp_diff` (ATP ranking-point difference) and
+`elo_diff` (Elo rating difference) as predictors. The rationale is that
+these two features capture different signals: ranking points reflect
+official ATP standings over the past 12 months, while Elo reflects
+cumulative match-by-match form that updates dynamically. A player
+returning from injury may have high ranking points but low Elo, or a
+rising player may have the opposite. Following Hvattum and Arntzen (2010),
+who used Elo as a logistic regression covariate, we extend their approach
+by including both predictors simultaneously.
+
+```{r combined-prep}
+# Attach rp_diff to the training hybrid data
+# (rp_diff is already in the original train data, we need it in train_hybrid)
+train_hybrid$rp_diff <- train_elo$rp_diff
+```
+
+```{r combined-fit}
+hybrid_combined <- glm(
+  outcome_int ~ 0 + rp_diff + elo_diff,
+  data   = train_hybrid,
+  family = binomial(link = "logit")
+)
+
+summary(hybrid_combined)
+```
+
+```{r combined-test}
+test_elo$prob_combined <- predict(
+  hybrid_combined,
+  newdata = test_elo,
+  type    = "response"
+)
+
+y_comb <- test_elo$outcome_int
+p_comb <- test_elo$prob_combined+
+
+accuracy_from_prob(y_comb, p_comb)
+log_loss(y_comb, p_comb)
+brier_score(y_comb, p_comb)
+```
+
+```{r combined-roc}
+test_elo_roc <- test_elo %>%
+  mutate(outcome_fac = factor(outcome_int, levels = c(0, 1)))
+
+roc_combined <- roc_curve(test_elo_roc,
+                          truth       = outcome_fac,
+                          prob_combined,
+                          event_level = "second")
+autoplot(roc_combined) +
+  labs(
+    title = "ROC Curve – Combined Model: rp_diff + elo_diff (2019)",
+    x     = "1 - Specificity (False Positive Rate)",
+    y     = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal(base_size = 14)
+
+roc_auc(test_elo_roc,
+        truth       = outcome_fac,
+        prob_combined,
+        event_level = "second")
+```
+
+```{r combined-calibration}
+calib_combined <- calibration_table(y_comb, p_comb, bins = 10)
+plot_calibration(calib_combined,
+                 "Calibration Curve – Combined rp_diff + elo_diff (2019)",
+                 colour = "darkblue")
+```
+
+## Full Extended Combined Model
+
+The final model incorporates all available features: both player-strength
+signals (`rp_diff` and `elo_diff`), contextual variables (`surface` and
+`tour_lvl`), and interaction terms (`elo_diff:surface`) to allow the
+effect of Elo to vary across playing surfaces. This represents the most
+comprehensive specification in the project.
+
+```{r full-combined-fit}
+hybrid_full <- glm(
+  outcome_int ~ 0 + rp_diff + elo_diff + surface + tour_lvl + elo_diff:surface,
+  data   = train_hybrid,
+  family = binomial(link = "logit")
+)
+
+summary(hybrid_full)
+```
+
+```{r full-combined-anova}
+anova(hybrid_full)
+```
+
+```{r full-combined-test}
+test_elo$prob_full <- predict(
+  hybrid_full,
+  newdata = test_elo,
+  type    = "response"
+)
+
+y_full <- test_elo$outcome_int
+p_full <- test_elo$prob_full
+
+accuracy_from_prob(y_full, p_full)
+log_loss(y_full, p_full)
+brier_score(y_full, p_full)
+```
+
+```{r full-combined-roc}
+test_elo_roc <- test_elo %>%
+  mutate(outcome_fac = factor(outcome_int, levels = c(0, 1)))
+
+roc_full <- roc_curve(test_elo_roc,
+                      truth       = outcome_fac,
+                      prob_full,
+                      event_level = "second")
+autoplot(roc_full) +
+  labs(
+    title = "ROC Curve – Full Extended Combined Model (2019)",
+    x     = "1 - Specificity (False Positive Rate)",
+    y     = "Sensitivity (True Positive Rate)"
+  ) +
+  theme_minimal(base_size = 14)
+
+roc_auc(test_elo_roc,
+        truth       = outcome_fac,
+        prob_full,
+        event_level = "second")
+```
+
+```{r full-combined-calibration}
+calib_full <- calibration_table(y_full, p_full, bins = 10)
+plot_calibration(calib_full,
+                 "Calibration Curve – Full Extended Combined (2019)",
+                 colour = "darkgreen")
+```
+
+## Intercept Models 
+
+ allowing a nonzero intercept to improve
+calibration. All previous models used `~ 0 + ...` which forces a 50%
+prediction when all predictors are zero. Removing this constraint lets
+the model learn a baseline win probability, which may improve how
+well the predicted probabilities match actual outcomes.
+
+We test this on the three key Part B models where calibration was poorest.
+
+### Hybrid Baseline with Intercept
+
+```{r hybrid-intercept-fit}
+hybrid_base_int <- glm(
+  outcome_int ~ elo_diff,
+  data   = train_hybrid,
+  family = binomial(link = "logit")
+)
+
+summary(hybrid_base_int)
+```
+
+```{r hybrid-intercept-test}
+test_elo$prob_hyb_base_int <- predict(
+  hybrid_base_int,
+  newdata = test_elo,
+  type    = "response"
+)
+
+y_hbi <- test_elo$outcome_int
+p_hbi <- test_elo$prob_hyb_base_int
+
+accuracy_from_prob(y_hbi, p_hbi)
+log_loss(y_hbi, p_hbi)
+brier_score(y_hbi, p_hbi)
+```
+
+```{r hybrid-intercept-calibration}
+calib_hbi <- calibration_table(y_hbi, p_hbi, bins = 10)
+plot_calibration(calib_hbi,
+                 "Calibration Curve – Hybrid Baseline with Intercept (2019)",
+                 colour = "steelblue")
+```
+
+### Combined Model with Intercept
+
+```{r combined-intercept-fit}
+hybrid_combined_int <- glm(
+  outcome_int ~ rp_diff + elo_diff,
+  data   = train_hybrid,
+  family = binomial(link = "logit")
+)
+
+summary(hybrid_combined_int)
+```
+
+```{r combined-intercept-test}
+test_elo$prob_comb_int <- predict(
+  hybrid_combined_int,
+  newdata = test_elo,
+  type    = "response"
+)
+
+y_ci <- test_elo$outcome_int
+p_ci <- test_elo$prob_comb_int
+
+accuracy_from_prob(y_ci, p_ci)
+log_loss(y_ci, p_ci)
+brier_score(y_ci, p_ci)
+```
+
+```{r combined-intercept-calibration}
+calib_ci <- calibration_table(y_ci, p_ci, bins = 10)
+plot_calibration(calib_ci,
+                 "Calibration Curve – Combined with Intercept (2019)",
+                 colour = "navy")
+```
+
+### Full Model with Intercept
+
+```{r full-intercept-fit}
+hybrid_full_int <- glm(
+  outcome_int ~ rp_diff + elo_diff + surface + tour_lvl + elo_diff:surface,
+  data   = train_hybrid,
+  family = binomial(link = "logit")
+)
+
+summary(hybrid_full_int)
+```
+
+```{r full-intercept-anova}
+anova(hybrid_full_int)
+```
+
+```{r full-intercept-test}
+test_elo$prob_full_int <- predict(
+  hybrid_full_int,
+  newdata = test_elo,
+  type    = "response"
+)
+
+y_fi <- test_elo$outcome_int
+p_fi <- test_elo$prob_full_int
+
+accuracy_from_prob(y_fi, p_fi)
+log_loss(y_fi, p_fi)
+brier_score(y_fi, p_fi)
+```
+
+```{r full-intercept-calibration}
+calib_fi <- calibration_table(y_fi, p_fi, bins = 10)
+plot_calibration(calib_fi,
+                 "Calibration Curve – Full Model with Intercept (2019)",
+                 colour = "darkgreen")
+```
+
+---
+
+# Visualisations for Report
+
+```{r overlaid-roc, fig.cap="ROC curves for the three core modelling approaches evaluated on the 2019 test set. All models show similar discriminative ability, with AUC values between 0.665 and 0.669."}
+# Overlaid ROC curves for key models
+roc_data_base <- roc_curve(
+  test %>% mutate(outcome = factor(outcome, levels = c(0, 1))),
+  truth = outcome, prob_base, event_level = "second"
+) %>% mutate(Model = "Logistic baseline")
+
+roc_data_elo <- roc_curve(
+  test_elo %>% mutate(outcome_fac = factor(outcome_int, levels = c(0, 1))),
+  truth = outcome_fac, elo_prob_base, event_level = "second"
+) %>% mutate(Model = "Elo baseline")
+
+roc_data_hyb <- roc_curve(
+  test_elo %>% mutate(outcome_fac = factor(outcome_int, levels = c(0, 1))),
+  truth = outcome_fac, prob_hybrid_base, event_level = "second"
+) %>% mutate(Model = "Hybrid baseline")
+
+roc_combined_plot <- bind_rows(roc_data_base, roc_data_elo, roc_data_hyb)
+
+ggplot(roc_combined_plot, aes(x = 1 - specificity, y = sensitivity, 
+                               colour = Model, linetype = Model)) +
+  geom_line(size = 1, alpha = 0.8) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50") +
+  labs(
+    title = "ROC Curves — Logistic vs Elo vs Hybrid (2019 Test Set)",
+    x = "1 - Specificity (False Positive Rate)",
+    y = "Sensitivity (True Positive Rate)"
+  ) +
+  scale_colour_manual(values = c("Logistic baseline" = "#4B9CD3",
+                                  "Elo baseline" = "#E8A838",
+                                  "Hybrid baseline" = "#8B5CF6")) +
+  scale_linetype_manual(values = c("Logistic baseline" = "solid",
+                                    "Elo baseline" = "dashed",
+                                    "Hybrid baseline" = "dotted")) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+```
+
+```{r logloss-barchart, fig.cap="Log-loss comparison across all 12 models. Lower values indicate better probabilistic calibration. The logistic baseline achieves the lowest log-loss (0.655), while hybrid and combined models show substantially worse calibration."}
+# Bar chart of log-loss across all models
+logloss_data <- tibble(
+  Model = c(
+    "Logistic\nbaseline", "Logistic\nextended",
+    "Elo\nbaseline", "Elo\nsurface-K",
+    "Hybrid\nbaseline", "Hybrid\nextended",
+    "Hybrid\ninteraction", "Combined\nrp+elo",
+    "Full\nextended",
+    "Hybrid\n+intercept", "Combined\n+intercept", "Full\n+intercept"
+  ),
+  Log_Loss = c(
+    log_loss(y_base, p_base), log_loss(y_ext1, p_ext1),
+    log_loss(y_elo, p_elo), log_loss(y_elo_ext, p_elo_ext),
+    log_loss(y_hyb, p_hyb), log_loss(y_hyb_ext, p_hyb_ext),
+    log_loss(y_hyb_int, p_hyb_int), log_loss(y_comb, p_comb),
+    log_loss(y_full, p_full),
+    log_loss(y_hbi, p_hbi), log_loss(y_ci, p_ci), log_loss(y_fi, p_fi)
+  ),
+  Group = c(
+    "Part A", "Part A", "Part A", "Part A",
+    "Part B", "Part B", "Part B", "Part B", "Part B",
+    "Part B (intercept)", "Part B (intercept)", "Part B (intercept)"
+  )
+)
+
+logloss_data$Model <- factor(logloss_data$Model, levels = logloss_data$Model)
+
+ggplot(logloss_data, aes(x = Model, y = Log_Loss, fill = Group)) +
+  geom_col(width = 0.7) +
+  geom_hline(yintercept = 0.6931, linetype = "dashed", colour = "red", size = 0.5) +
+  annotate("text", x = 12, y = 0.698, label = "No-skill (0.693)", colour = "red", size = 3, hjust = 1) +
+  labs(
+    title = "Log-Loss Comparison Across All Models",
+    y = "Log-Loss (lower = better)",
+    x = NULL
+  ) +
+  scale_fill_manual(values = c("Part A" = "#4B9CD3",
+                                "Part B" = "#8B5CF6",
+                                "Part B (intercept)" = "#E8A838")) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(size = 8),
+        legend.position = "bottom")
+```
+
+```{r calibration-comparison, fig.cap="Calibration curves for the logistic baseline (left) and hybrid baseline (right). Points on the dashed diagonal indicate perfect calibration. The logistic baseline tracks the diagonal more closely, while the hybrid model shows greater deviation."}
+# Side-by-side calibration curves
+calib_logistic <- calibration_table(y_base, p_base, bins = 10) %>%
+  mutate(Model = "Logistic baseline")
+calib_hybrid_compare <- calibration_table(y_hyb, p_hyb, bins = 10) %>%
+  mutate(Model = "Hybrid baseline")
+
+calib_both <- bind_rows(calib_logistic, calib_hybrid_compare)
+
+ggplot(calib_both, aes(x = mean_pred, y = mean_actual, colour = Model)) +
+  geom_point(size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "red") +
+  facet_wrap(~Model) +
+  labs(
+    title = "Calibration Curves — Logistic Baseline vs Hybrid Baseline",
+    x = "Mean Predicted Probability",
+    y = "Empirical Win Rate"
+  ) +
+  scale_colour_manual(values = c("Logistic baseline" = "#4B9CD3",
+                                  "Hybrid baseline" = "#8B5CF6")) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+```
+
+---
+
+# Model Comparison
+
+```{r comparison-table}
+results <- tibble(
+  Model = c(
+    "Logistic (baseline)",
+    "Logistic (extended)",
+    "Elo (baseline)",
+    "Elo (surface-K)",
+    "Hybrid: Elo diff only",
+    "Hybrid: Elo diff + surface + tour",
+    "Hybrid: Elo diff × surface interaction",
+    "Combined: rp_diff + elo_diff",
+    "Full: rp + elo + surface + tour + interact",
+    "Hybrid baseline + intercept",
+    "Combined + intercept",
+    "Full + intercept"
+  ),
+  Accuracy = c(
+    accuracy_from_prob(y_base,    p_base),
+    accuracy_from_prob(y_ext1,    p_ext1),
+    accuracy_from_prob(y_elo,     p_elo),
+    accuracy_from_prob(y_elo_ext, p_elo_ext),
+    accuracy_from_prob(y_hyb,     p_hyb),
+    accuracy_from_prob(y_hyb_ext, p_hyb_ext),
+    accuracy_from_prob(y_hyb_int, p_hyb_int),
+    accuracy_from_prob(y_comb,    p_comb),
+    accuracy_from_prob(y_full,    p_full),
+    accuracy_from_prob(y_hbi,     p_hbi),
+    accuracy_from_prob(y_ci,      p_ci),
+    accuracy_from_prob(y_fi,      p_fi)
+  ),
+  Log_Loss = c(
+    log_loss(y_base,    p_base),
+    log_loss(y_ext1,    p_ext1),
+    log_loss(y_elo,     p_elo),
+    log_loss(y_elo_ext, p_elo_ext),
+    log_loss(y_hyb,     p_hyb),
+    log_loss(y_hyb_ext, p_hyb_ext),
+    log_loss(y_hyb_int, p_hyb_int),
+    log_loss(y_comb,    p_comb),
+    log_loss(y_full,    p_full),
+    log_loss(y_hbi,     p_hbi),
+    log_loss(y_ci,      p_ci),
+    log_loss(y_fi,      p_fi)
+  ),
+  Brier_Score = c(
+    brier_score(y_base,    p_base),
+    brier_score(y_ext1,    p_ext1),
+    brier_score(y_elo,     p_elo),
+    brier_score(y_elo_ext, p_elo_ext),
+    brier_score(y_hyb,     p_hyb),
+    brier_score(y_hyb_ext, p_hyb_ext),
+    brier_score(y_hyb_int, p_hyb_int),
+    brier_score(y_comb,    p_comb),
+    brier_score(y_full,    p_full),
+    brier_score(y_hbi,     p_hbi),
+    brier_score(y_ci,      p_ci),
+    brier_score(y_fi,      p_fi)
+  )
+)
+
+results <- results %>%
+  mutate(across(where(is.numeric), ~round(.x, 4)))
+
+knitr::kable(
+  results,
+  caption = "Predictive performance of all models on 2019 ATP test set.
+             Lower log-loss and Brier score indicate better probabilistic accuracy.",
+  col.names = c("Model", "Accuracy", "Log-Loss", "Brier Score")
+)
+```
+
+---
+
+# Discussion
+
+The key improvement in this combined analysis over Part A is the correction
+of the outcome variable definition. In the original implementation, player_i
+was always assigned as the winner, which created a data leakage issue: the
+ranking-point difference predictor (derived from winner/loser points) was
+trivially positive for all outcome = 1 cases, producing artificially
+perfect accuracy and AUC. By randomly
+assigning player roles, the models now face a genuine prediction task.
+
+
